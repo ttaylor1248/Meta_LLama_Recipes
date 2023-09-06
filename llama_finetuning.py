@@ -12,21 +12,23 @@ from pkg_resources import packaging
 from torch.distributed.fsdp import (
     FullyShardedDataParallel as FSDP,
 )
+from torch.distributed.fsdp.fully_sharded_data_parallel import CPUOffload
 from torch.optim.lr_scheduler import StepLR
 from torch.utils.data import DistributedSampler
 from transformers import (
     LlamaForCausalLM,
-    LlamaTokenizer,
+    AutoTokenizer,
     LlamaConfig,
     default_data_collator,
+    get_cosine_schedule_with_warmup
 )
 from transformers.models.llama.modeling_llama import LlamaDecoderLayer
 
 import policies
-from configs import fsdp_config, train_config
+from configs import fsdp_config, train_config, wandb_config
 from policies import AnyPrecisionAdamW
 
-from utils import fsdp_auto_wrap_policy
+from utils import fsdp_auto_wrap_policy, wandb_watch
 from utils.config_utils import (
     update_config,
     generate_peft_config,
@@ -47,7 +49,7 @@ from utils.train_utils import (
 
 def main(**kwargs):
     # Update the configuration for the training and sharding process
-    update_config((train_config, fsdp_config), **kwargs)
+    update_config((train_config, fsdp_config, wandb_config), **kwargs)
 
     # Set the seeds for reproducibility
     torch.cuda.manual_seed(train_config.seed)
@@ -121,13 +123,9 @@ def main(**kwargs):
         model.to(torch.bfloat16)
 
     # Load the tokenizer and add special tokens
-    tokenizer = LlamaTokenizer.from_pretrained(train_config.model_name)
-    tokenizer.add_special_tokens(
-            {
-
-                "pad_token": "<PAD>",
-            }
-        )
+    tokenizer = AutoTokenizer.from_pretrained(train_config.model_name, model_max_length=4096, use_fast=True)
+    tokenizer.pad_token = tokenizer.eos_token
+    tokenizer.pad_token_id = tokenizer.eos_token_id
     if train_config.use_peft:
         peft_config = generate_peft_config(train_config, kwargs)
         model = get_peft_model(model, peft_config)
@@ -146,6 +144,7 @@ def main(**kwargs):
             model,
             auto_wrap_policy= my_auto_wrapping_policy if train_config.use_peft else wrapping_policy,
             mixed_precision=mixed_precision_policy if not fsdp_config.pure_bf16 else None,
+            cpu_offload=CPUOffload(offload_params=True) if fsdp_config.fsdp_cpu_offload else None,
             sharding_strategy=fsdp_config.sharding_strategy,
             device_id=torch.cuda.current_device(),
             limit_all_gathers=True,
@@ -176,7 +175,7 @@ def main(**kwargs):
         split="test",
     )
     if not train_config.enable_fsdp or rank == 0:
-            print(f"--> Validation Set Length = {len(dataset_val)}")
+        print(f"--> Validation Set Length = {len(dataset_val)}")
 
     train_sampler = None
     val_sampler = None
@@ -231,7 +230,16 @@ def main(**kwargs):
             lr=train_config.lr,
             weight_decay=0.0,
         )
-    scheduler = StepLR(optimizer, step_size=1, gamma=train_config.gamma)
+
+    if train_config.use_cosine_scheduler:
+        total_length = len(train_dataloader)//train_config.gradient_accumulation_steps
+        scheduler = get_cosine_schedule_with_warmup(optimizer, train_config.warmup_steps, total_length * train_config.num_epochs)
+    else:
+        scheduler = StepLR(optimizer, step_size=1, gamma=train_config.gamma)
+
+    wandb_run = None
+    if wandb_config.enable_wandb and (not train_config.enable_fsdp or rank == 0):
+        wandb_run = wandb_watch(model, wandb_config)
 
     # Start the training process
     results = train(
@@ -246,6 +254,8 @@ def main(**kwargs):
         fsdp_config if train_config.enable_fsdp else None,
         local_rank if train_config.enable_fsdp else None,
         rank if train_config.enable_fsdp else None,
+        wandb_run,
+        train_config.use_cosine_scheduler
     )
     if not train_config.enable_fsdp or rank==0:
         [print(f'Key: {k}, Value: {v}') for k, v in results.items()]

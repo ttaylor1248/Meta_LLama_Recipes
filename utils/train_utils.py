@@ -10,6 +10,7 @@ import time
 import fire
 import torch
 import transformers
+import wandb
 from datasets import load_dataset
 from tqdm import tqdm
 """
@@ -45,7 +46,7 @@ def set_tokenizer_params(tokenizer: LlamaTokenizer):
 def byte2mb(x):
     return int(x / 2**20)
 
-def train(model, train_dataloader,eval_dataloader, tokenizer, optimizer, lr_scheduler, gradient_accumulation_steps, train_config, fsdp_config=None, local_rank=None, rank=None):
+def train(model, train_dataloader,eval_dataloader, tokenizer, optimizer, lr_scheduler, gradient_accumulation_steps, train_config, fsdp_config=None, local_rank=None, rank=None, wandb_run=None, step_scheduler=False):
     """
     Trains the model on the given dataloader
     
@@ -60,6 +61,8 @@ def train(model, train_dataloader,eval_dataloader, tokenizer, optimizer, lr_sche
         train_config: The training configuration
         eval_dataloader: The dataloader containing the eval data
         tokenizer: tokenizer used in the eval for decoding the predicitons
+        wandb_run: The run object for wandb logging
+        step_scheduler: Does the scheduler need to be stepped after each update operation
     
     Returns: results dictionary containing average training and validation perplexity and loss
     """
@@ -101,16 +104,25 @@ def train(model, train_dataloader,eval_dataloader, tokenizer, optimizer, lr_sche
                         scaler.step(optimizer)
                         scaler.update()
                         optimizer.zero_grad()
-                        pbar.update(step//gradient_accumulation_steps)
+                        pbar.update()
+                        if step_scheduler:
+                            # Update the learning rate as needed
+                            lr_scheduler.step()
                 else:
                     # regular backpropagation when fp16 is not used
                     loss.backward()
                     if (step + 1) % gradient_accumulation_steps == 0 or step == len(train_dataloader) - 1:
                         optimizer.step()
                         optimizer.zero_grad()
-                        pbar.update(step//gradient_accumulation_steps)
+                        pbar.update()
+                        if step_scheduler:
+                            # Update the learning rate as needed
+                            lr_scheduler.step()
                 
-                pbar.set_description(f"Training Epoch: {epoch}/{train_config.num_epochs}, step {step}/{len(train_dataloader)} completed (loss: {loss.detach().float()})")
+                lr = lr_scheduler.get_last_lr()[0]
+                pbar.set_description(f"Training Epoch: {epoch}/{train_config.num_epochs}, step {step}/{len(train_dataloader)} completed (loss: {loss.detach().float()}, lr: {lr})")
+                if wandb_run is not None:
+                    wandb_run.log({"lr": lr, "loss": loss.detach().float(), "epoch": epoch + float(step) / len(train_dataloader)})
                 
         epoch_end_time = time.perf_counter()-epoch_start_time
         epoch_times.append(epoch_end_time)    
@@ -139,8 +151,9 @@ def train(model, train_dataloader,eval_dataloader, tokenizer, optimizer, lr_sche
             print(f"Cuda Malloc retires : {memtrace.cuda_malloc_retires}")
             print(f"CPU Total Peak Memory consumed during the train (max): {memtrace.cpu_peaked + memtrace.cpu_begin} GB")
         
-        # Update the learning rate as needed
-        lr_scheduler.step()
+        if not step_scheduler:
+            # Update the learning rate as needed
+            lr_scheduler.step()
           
         if train_config.run_validation:
             eval_ppl, eval_epoch_loss = evaluation(model, train_config, eval_dataloader, local_rank, tokenizer)
@@ -221,6 +234,9 @@ def train(model, train_dataloader,eval_dataloader, tokenizer, optimizer, lr_sche
     #saving the training params including fsdp setting for reference.
     if train_config.enable_fsdp and not train_config.use_peft:
         save_train_params(train_config, fsdp_config, rank)
+
+    if wandb_run is not None:
+        wandb_run.finish()
         
     return results
 
@@ -396,8 +412,6 @@ def save_train_params(train_config, fsdp_config, rank):
     train_config.dist_checkpoint_root_folder
     + "/"
     + train_config.dist_checkpoint_folder
-    + "-"
-    + train_config.model_name
     )
 
     save_dir = Path.cwd() / folder_name
