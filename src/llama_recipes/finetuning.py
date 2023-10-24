@@ -133,32 +133,6 @@ def main(**kwargs):
         model = get_peft_model(model, peft_config)
         model.print_trainable_parameters()
 
-    #setting up FSDP if enable_fsdp is enabled
-    if train_config.enable_fsdp:
-        if not train_config.use_peft and train_config.freeze_layers:
-
-            freeze_transformer_layers(train_config.num_freeze_layers)
-
-        mixed_precision_policy, wrapping_policy = get_policies(fsdp_config, rank)
-        my_auto_wrapping_policy = fsdp_auto_wrap_policy(model, LlamaDecoderLayer)
-
-        model = FSDP(
-            model,
-            auto_wrap_policy= my_auto_wrapping_policy if train_config.use_peft else wrapping_policy,
-            cpu_offload=CPUOffload(offload_params=True) if fsdp_config.fsdp_cpu_offload else None,
-            mixed_precision=mixed_precision_policy if not fsdp_config.pure_bf16 else None,
-            sharding_strategy=fsdp_config.sharding_strategy,
-            device_id=torch.cuda.current_device(),
-            limit_all_gathers=True,
-            sync_module_states=train_config.low_cpu_fsdp,
-            param_init_fn=lambda module: module.to_empty(device=torch.device("cuda"), recurse=False)
-            if train_config.low_cpu_fsdp and rank != 0 else None,
-        )
-        if fsdp_config.fsdp_activation_checkpointing:
-            apply_fsdp_checkpointing(model)
-    elif not train_config.quantization and not train_config.enable_fsdp:
-        model.to("cuda")
-
     dataset_config = generate_dataset_config(train_config, kwargs)
 
      # Load and preprocess the dataset for training and validation
@@ -217,6 +191,35 @@ def main(**kwargs):
             drop_last=True,
             collate_fn=default_data_collator,
         )
+        
+    # If special tokens added to tokenizer
+    model.resize_token_embeddings(len(tokenizer))      
+        
+    #setting up FSDP if enable_fsdp is enabled
+    if train_config.enable_fsdp:
+        if not train_config.use_peft and train_config.freeze_layers:
+
+            freeze_transformer_layers(train_config.num_freeze_layers)
+
+        mixed_precision_policy, wrapping_policy = get_policies(fsdp_config, rank)
+        my_auto_wrapping_policy = fsdp_auto_wrap_policy(model, LlamaDecoderLayer)
+
+        model = FSDP(
+            model,
+            auto_wrap_policy= my_auto_wrapping_policy if train_config.use_peft else wrapping_policy,
+            cpu_offload=CPUOffload(offload_params=True) if fsdp_config.fsdp_cpu_offload else None,
+            mixed_precision=mixed_precision_policy if not fsdp_config.pure_bf16 else None,
+            sharding_strategy=fsdp_config.sharding_strategy,
+            device_id=torch.cuda.current_device(),
+            limit_all_gathers=True,
+            sync_module_states=train_config.low_cpu_fsdp,
+            param_init_fn=lambda module: module.to_empty(device=torch.device("cuda"), recurse=False)
+            if train_config.low_cpu_fsdp and rank != 0 else None,
+        )
+        if fsdp_config.fsdp_activation_checkpointing:
+            apply_fsdp_checkpointing(model)
+    elif not train_config.quantization and not train_config.enable_fsdp:
+        model.to("cuda")
 
     # Initialize the optimizer and learning rate scheduler
     if fsdp_config.pure_bf16 and fsdp_config.optimizer == "anyprecision":
