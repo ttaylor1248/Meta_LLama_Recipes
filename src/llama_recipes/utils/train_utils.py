@@ -22,6 +22,7 @@ from llama_recipes.model_checkpointing import save_model_checkpoint, save_model_
 from llama_recipes.policies import fpSixteen,bfSixteen, get_llama_wrapper
 from llama_recipes.utils.memory_utils import MemoryTrace
 
+from llama_recipes.utils.config_utils import generate_dict_from_configs
 
 def set_tokenizer_params(tokenizer: LlamaTokenizer):
     tokenizer.pad_token_id = 0
@@ -31,7 +32,7 @@ def set_tokenizer_params(tokenizer: LlamaTokenizer):
 def byte2mb(x):
     return int(x / 2**20)
 
-def train(model, train_dataloader,eval_dataloader, tokenizer, optimizer, lr_scheduler, gradient_accumulation_steps, train_config, fsdp_config=None, local_rank=None, rank=None):
+def train(model, train_dataloader,eval_dataloader, tokenizer, optimizer, lr_scheduler, gradient_accumulation_steps, train_config, fsdp_config=None, local_rank=None, rank=None, tracker=None):
     """
     Trains the model on the given dataloader
 
@@ -66,6 +67,9 @@ def train(model, train_dataloader,eval_dataloader, tokenizer, optimizer, lr_sche
     checkpoint_times = []
     results = {}
     best_val_loss = float("inf")
+
+    track_metrics = not (train_config.enable_fsdp and rank != 0)
+
     for epoch in range(train_config.num_epochs):
         epoch_start_time = time.perf_counter()
         with MemoryTrace() as memtrace:  # track the memory usage
@@ -126,19 +130,17 @@ def train(model, train_dataloader,eval_dataloader, tokenizer, optimizer, lr_sche
         train_prep.append(train_perplexity)
         train_loss.append(train_epoch_loss)
 
-        if train_config.enable_fsdp:
-            if rank==0:
-                print(f"Max CUDA memory allocated was {memtrace.peak} GB")
-                print(f"Max CUDA memory reserved was {memtrace.max_reserved} GB")
-                print(f"Peak active CUDA memory was {memtrace.peak_active_gb} GB")
-                print(f"Cuda Malloc retires : {memtrace.cuda_malloc_retires}")
-                print(f"CPU Total Peak Memory consumed during the train (max): {memtrace.cpu_peaked + memtrace.cpu_begin} GB")
-        else:
+        if track_metrics:
             print(f"Max CUDA memory allocated was {memtrace.peak} GB")
             print(f"Max CUDA memory reserved was {memtrace.max_reserved} GB")
             print(f"Peak active CUDA memory was {memtrace.peak_active_gb} GB")
             print(f"Cuda Malloc retires : {memtrace.cuda_malloc_retires}")
             print(f"CPU Total Peak Memory consumed during the train (max): {memtrace.cpu_peaked + memtrace.cpu_begin} GB")
+
+        if tracker is not None and track_metrics:
+            tracker.track(epoch_end_time , name='epoch_times', stage='train')
+            tracker.track(train_epoch_loss , name='train_loss', stage='train')
+            tracker.track(train_perplexity , name='train_perplexity', stage='train')
 
         # Update the learning rate as needed
         lr_scheduler.step()
@@ -190,17 +192,14 @@ def train(model, train_dataloader,eval_dataloader, tokenizer, optimizer, lr_sche
             checkpoint_times.append(checkpoint_end_time)
             if eval_epoch_loss < best_val_loss:
                 best_val_loss = eval_epoch_loss
-                if train_config.enable_fsdp:
-                    if rank==0:
-                        print(f"best eval loss on epoch {epoch+1} is {best_val_loss}")
-                else:
+                if track_metrics:
                     print(f"best eval loss on epoch {epoch+1} is {best_val_loss}")
+            if tracker is not None and track_metrics:
+                tracker.track(best_val_loss , name='best_val_loss', stage='validation')
+                tracker.track(eval_epoch_loss , name='eval_epoch_loss', stage='validation')
             val_loss.append(best_val_loss)
             val_prep.append(eval_ppl)
-        if train_config.enable_fsdp:
-            if rank==0:
-                print(f"Epoch {epoch+1}: train_perplexity={train_perplexity:.4f}, train_epoch_loss={train_epoch_loss:.4f}, epoch time {epoch_end_time}s")
-        else:
+        if track_metrics:
             print(f"Epoch {epoch+1}: train_perplexity={train_perplexity:.4f}, train_epoch_loss={train_epoch_loss:.4f}, epoch time {epoch_end_time}s")
     avg_epoch_time = sum(epoch_times)/ len(epoch_times)
     avg_checkpoint_time = sum(checkpoint_times)/ len(checkpoint_times) if len(checkpoint_times) > 0 else 0
@@ -217,6 +216,17 @@ def train(model, train_dataloader,eval_dataloader, tokenizer, optimizer, lr_sche
         results['avg_eval_loss'] = avg_eval_loss
     results["avg_epoch_time"] = avg_epoch_time
     results["avg_checkpoint_time"] = avg_checkpoint_time
+
+    if tracker is not None and track_metrics:
+        tracker.track(avg_train_loss , name='avg_train_loss', stage='experiment')
+        tracker.track(avg_train_prep, name='avg_train_prep', stage='experiment')
+
+        if train_config.run_validation:
+            tracker.track(avg_eval_prep , name='avg_eval_prep', stage='validation')
+            tracker.track(avg_eval_loss, name='avg_eval_loss', stage='validation')
+
+        tracker.track(avg_epoch_time , name='avg_epoch_time', stage='experiment')
+        tracker.track(avg_checkpoint_time , name='avg_checkpoint_time', stage='experiment')
 
     #saving the training params including fsdp setting for reference.
     if train_config.enable_fsdp and not train_config.use_peft:
@@ -387,8 +397,8 @@ def save_train_params(train_config, fsdp_config, rank):
     """
     # Convert the train_config and fsdp_config objects to dictionaries,
     # converting all values to strings to ensure they can be serialized into a YAML file
-    train_config_dict = {k: str(v) for k, v in vars(train_config).items() if not k.startswith('__')}
-    fsdp_config_dict = {k: str(v) for k, v in vars(fsdp_config).items() if not k.startswith('__')}
+    train_config_dict = generate_dict_from_configs(train_config)
+    fsdp_config_dict = generate_dict_from_configs(fsdp_config)
     # Merge the two dictionaries into one
     train_params_dict = {**train_config_dict, **fsdp_config_dict}
     # Construct the folder name (follwoing FSDP checkpointing style) using properties of the train_config object
